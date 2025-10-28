@@ -1,0 +1,371 @@
+﻿using Advanced.CMS.AdvancedReviews;
+//using Advanced.CMS.BulkEdit;
+using Advanced.CMS.GroupingHeader;
+using Advanced.CMS.ImagePreview;
+using Alloy.MediaReport;
+using Azure.Identity;
+using Azure.Security.KeyVault.Certificates;
+using Azure.Security.KeyVault.Secrets;
+using dotcentric.Optimizely.Unpublish;
+using EPiServer.Authorization;
+using EPiServer.Cms.TinyMce.SpellChecker;
+using Epinova.CMS.AiAssistant;
+using EPiServer.ContentApi.Cms;
+using EPiServer.ContentApi.Cms.Internal;
+using EPiServer.ContentApi.Commerce;
+using EPiServer.ContentDefinitionsApi;
+using EPiServer.ContentManagementApi;
+using EPiServer.Data;
+using EPiServer.Labs.ContentManager;
+using EPiServer.Labs.ProjectEnhancements;
+using EPiServer.Marketing.Testing.Web.Initializers;
+using EPiServer.OpenIDConnect;
+using EPiServer.ServiceApi;
+using EPiServer.Shell.Modules;
+using EPiServer.Social.Framework;
+using Foundation.Features.Checkout.Payments;
+using Foundation.Infrastructure.Cms.ModelBinders;
+using Foundation.Infrastructure.Cms.Users;
+using Foundation.Infrastructure.Display;
+using Geta.NotFoundHandler.Infrastructure.Configuration;
+using Geta.NotFoundHandler.Infrastructure.Initialization;
+using Geta.NotFoundHandler.Optimizely.Infrastructure.Configuration;
+using Geta.Optimizely.Categories.Configuration;
+using Geta.Optimizely.Categories.Find.Infrastructure.Initialization;
+using Geta.Optimizely.Categories.Infrastructure.Initialization;
+using Geta.Optimizely.Sitemaps;
+using Geta.Optimizely.Sitemaps.Commerce;
+using Mediachase.Commerce.Anonymous;
+using Mediachase.Commerce.Orders;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Optimizely.Labs.MarketingAutomationIntegration.ODP;
+using System.IO;
+using System.Security.Cryptography.X509Certificates;
+using TinymceDamPicker;
+using UNRVLD.ODP.VisitorGroups.Initilization;
+using VisualCompareMode;
+
+namespace Foundation
+{
+    public class Startup
+    {
+        private readonly IWebHostEnvironment _webHostingEnvironment;
+        private readonly IConfiguration _configuration;
+
+        public Startup(IWebHostEnvironment webHostingEnvironment, IConfiguration configuration)
+        {
+            _webHostingEnvironment = webHostingEnvironment;
+            _configuration = configuration;
+        }
+
+        // This method gets called by the runtime. Use this method to add services to the container.
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.Configure<DataAccessOptions>(options => options.ConnectionStrings.Add(new ConnectionStringOptions
+            {
+                Name = "EcfSqlConnection",
+                ConnectionString = _configuration.GetConnectionString("EcfSqlConnection")
+            }));
+            services.AddCmsAspNetIdentity<SiteUser>(o =>
+            {
+                if (string.IsNullOrEmpty(o.ConnectionStringOptions?.ConnectionString))
+                {
+                    o.ConnectionStringOptions = new ConnectionStringOptions
+                    {
+                        Name = "EcfSqlConnection",
+                        ConnectionString = _configuration.GetConnectionString("EcfSqlConnection")
+                    };
+                }
+            });
+
+            //UI
+            var openIdOptions = new OpenIddictServerBuilder(services);
+            if (_webHostingEnvironment.IsDevelopment())
+            {
+                services.Configure<ClientResourceOptions>(uiOptions =>
+                {
+                    uiOptions.Debug = true;
+                    openIdOptions.AddDevelopmentSigningCertificate();
+                });
+            }
+            else
+            {
+                // Production: Fetch certificate info from Key Vault
+                string keyVaultUrl = "https://epinovademostackkeyvault.vault.azure.net/";
+                var secretClient = new SecretClient(new Uri(keyVaultUrl), new DefaultAzureCredential());
+
+                // Hent PFX (Base64)
+                var pfxSecret = secretClient.GetSecret("EpinovaFoundationDemoCert");
+                // Hent passordet
+                var passwordSecret = secretClient.GetSecret("EpinovaFoundationDemoCertPassword");
+                
+                // Lag X509Certificate2 med privat nøkkel
+                var certBytes = Convert.FromBase64String(pfxSecret.Value.Value);
+                var signingCert = new X509Certificate2(certBytes, (string)null,
+                    X509KeyStorageFlags.MachineKeySet |
+                    X509KeyStorageFlags.EphemeralKeySet);
+
+                // Midlertidig nøkkel (ikke produksjon)
+                //openIdOptions.AddEphemeralEncryptionKey();
+                
+                // Bruk i OpenIddict
+                openIdOptions.AddSigningCertificate(signingCert);
+                openIdOptions.AllowAuthorizationCodeFlow();
+                openIdOptions.SetTokenEndpointUris("/connect/token");
+
+                
+
+            }
+
+            services.AddMvc(o =>
+            {
+                o.Conventions.Add(new FeatureConvention());
+                o.ModelBinderProviders.Insert(0, new DecimalModelBinderProvider());
+                o.ModelBinderProviders.Insert(0, new PaymentModelBinderProvider());
+            })
+            .AddRazorOptions(ro => ro.ViewLocationExpanders.Add(new FeatureViewLocationExpander()));
+
+            services.AddCommerce();
+
+            //services.AddFind(); // Note: currently added via AddContentSearchApi()
+            services.AddSocialFramework();
+            services.AddDisplay();
+            services.TryAddEnumerable(Microsoft.Extensions.DependencyInjection.ServiceDescriptor.Singleton(typeof(IFirstRequestInitializer), typeof(ContentInstaller)));
+            services.AddDetection();
+            services.AddTinyMceConfiguration();
+            services.AddTinyMceSpellChecker();
+
+            // BlockEnhancements (Experimental)
+            //services.AddBlockEnhancements();
+
+            //site specific
+            services.AddEmbeddedLocalization<Startup>();
+            services.Configure<OrderOptions>(o => o.DisableOrderDataLocalization = true);
+
+            services.ConfigureContentApiOptions(o =>
+            {
+                o.EnablePreviewFeatures = true;
+                o.IncludeEmptyContentProperties = true;
+                o.FlattenPropertyModel = false;
+                o.IncludeMasterLanguage = false;
+
+            });
+
+            // Content Delivery API
+            services.AddContentDeliveryApi()
+                .WithFriendlyUrl()
+                .WithSiteBasedCors();
+            services.AddContentDeliveryApi(OpenIDConnectOptionsDefaults.AuthenticationScheme, options => {
+                options.SiteDefinitionApiEnabled = true;
+            })
+               .WithFriendlyUrl()
+               .WithSiteBasedCors();
+
+            // Content Delivery Search API
+            services.AddContentSearchApi(o =>
+            {
+                o.MaximumSearchResults = 100;
+            });
+
+            // Content Delivery Forms API
+            services.AddFormsApi();
+
+            // Content Delivery Commerce API
+            services.AddCommerceApi<SiteUser>(OpenIDConnectOptionsDefaults.AuthenticationScheme, o =>
+            {
+                o.DisableScopeValidation = true;
+            });
+
+            // Content Definitions API
+            services.AddContentDefinitionsApi(options =>
+            {
+                // Accept anonymous calls
+                options.DisableScopeValidation = true;
+            });
+
+            // Content Management
+            services.AddContentManagementApi(OpenIDConnectOptionsDefaults.AuthenticationScheme, options =>
+            {
+                // Accept anonymous calls
+                options.DisableScopeValidation = true;
+            });
+
+            // Service API configuration
+            services.AddServiceApiAuthorization(OpenIDConnectOptionsDefaults.AuthenticationScheme);
+
+            if (_webHostingEnvironment.IsDevelopment())
+            {
+                services.AddOpenIDConnect<SiteUser>(
+                    useDevelopmentCertificate:
+                    true,
+                    signingCertificate: null,
+                    encryptionCertificate: null,
+                    createSchema: true,
+                    options =>
+                    {
+                        //options.RequireHttps = !_webHostingEnvironment.IsDevelopment();
+                        var application = new OpenIDConnectApplication()
+                        {
+                            ClientId = "postman-client",
+                            ClientSecret = "postman",
+                            Scopes =
+                            {
+                                ContentDeliveryApiOptionsDefaults.Scope,
+                                ContentManagementApiOptionsDefaults.Scope,
+                                ContentDefinitionsApiOptionsDefaults.Scope,
+                                CommerceApiOptionsDefaults.Scope,
+                                ServiceApiOptionsDefaults.Scope
+                            }
+                        };
+
+                        // Using Postman for testing purpose.
+                        // The authorization code is sent to postman after successful authentication.
+                        application.RedirectUris.Add(new Uri("https://oauth.pstmn.io/v1/callback"));
+                        options.Applications.Add(application);
+                        options.AllowResourceOwnerPasswordFlow = true;
+
+                        options.Applications.Add(new OpenIDConnectApplication()
+                        {
+                            ClientId = "anon-client",
+                            Scopes = {
+                            CommerceApiOptionsDefaults.Scope,
+                            "anonymous_id"
+                        }
+                        });
+                        options.AllowAnonymousFlow = true;
+                    });
+            }
+                       
+            
+
+            services.AddOpenIDConnectUI();
+
+            services.ConfigureContentDeliveryApiSerializer(settings => settings.NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore);
+
+            services.AddNotFoundHandler(o => o.UseSqlServer(_configuration.GetConnectionString("EPiServerDB")), policy => policy.RequireRole(Roles.CmsAdmins));
+            services.AddOptimizelyNotFoundHandler();
+            services.Configure<ProtectedModuleOptions>(x =>
+            {
+                if (!x.Items.Any(x => x.Name.Equals("Foundation")))
+                {
+                    x.Items.Add(new ModuleDetails
+                    {
+                        Name = "Foundation"
+                    });
+                }
+            });
+            // Don't camelCase Json output -- leave property names unchanged
+            //services.AddControllers()
+            //    .AddJsonOptions(options =>
+            //    {
+            //        options.JsonSerializerOptions.PropertyNamingPolicy = null;
+            //    });
+
+            // Add AdvancedReviews
+            services.AddAdvancedReviews();
+            services.AddGetaCategories();
+            services.AddODPVisitorGroups();
+
+            // Add Welcome DAM
+            services.AddDAMUi();
+
+            // Epinova AI Assistant
+            services.AddAiAssistant();
+
+            //Configure GeoLocation for Visitor Groups, etc
+            services.AddMaxMindGeolocationProvider(o =>
+            {
+                o.DatabasePath = Path.Combine(_webHostingEnvironment.ContentRootPath, "App_Data", "GeoLite2-City.mmdb");
+                o.LocationsDatabasePath = Path.Combine(_webHostingEnvironment.ContentRootPath, "App_Data", "GeoLite2-City-Locations-en.csv");
+            });
+
+            // URLs for files in contentassets folder shows friendly URL
+            services.Configure<RoutingOptions>(o =>
+            {
+                o.ContentAssetsBasePath = ContentAssetsBasePath.ContentOwner;
+            });
+
+            // Add ODP MA Connector (note: requires API key in appsettings.json)
+            services.AddMarketingAutomationIntegrationODP(_configuration);
+            services.AddFormRepositoryWorkAround();
+
+            // Add A/B Testing Gadget
+            // https://github.com/episerver/content-ab-testing
+            services.AddABTesting(_configuration.GetConnectionString("EPiServerDB"));
+
+            // Add ContentManager
+            services.AddContentManager();
+
+            // Add GroupingHeader
+            // https://github.com/advanced-cms/grouping-header/
+            services.AddGroupingHeader();
+
+            // Bulk Edit add-on
+            //services.AddBulkEdit();
+
+            // Project Enhancements
+            services.AddProjectEnhancements();
+
+            // Adds the DAM selector button
+            services.AddDamSelectButton();
+
+            //MediaReport (Experimental)
+            services.AddMediaReport();
+
+            //Advanced Image Preview (Experimental)
+            services.AddImagePreview();
+
+            // Geta.Sitemaps generator
+            services.AddSitemaps(x =>
+            {
+                x.EnableRealtimeSitemap = false;
+                x.EnableRealtimeCaching = true;
+                x.RealtimeCacheExpirationInMinutes = 60;
+            });
+            services.AddSitemapsCommerce();
+
+            // Unpublish plugin
+            services.AddUnpublish();
+
+            // Visual Compare (EXperimental)
+            services.AddVisualCompareMode();
+
+
+        }
+
+        // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            app.UseNotFoundHandler();
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseGetaCategories();
+            app.UseGetaCategoriesFind();
+
+            app.UseAnonymousId();
+            app.UseStaticFiles();
+            app.UseRouting();
+            app.UseCors();
+            app.UseAuthentication();
+            app.UseAuthorization();
+            app.UseAnonymousCartMerging();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllerRoute(name: "Default", pattern: "{controller}/{action}/{id?}");
+                endpoints.MapControllers();
+                endpoints.MapRazorPages();
+                endpoints.MapContent();
+
+            });
+        }
+    }
+}
